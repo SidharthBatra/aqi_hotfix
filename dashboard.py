@@ -49,6 +49,7 @@ from train_model import (
     TIMESTAMP_COL,
     add_lag_and_rolling_features,
     add_time_features,
+    get_feature_columns,
 )
 
 # How many days of history to plot on the time-series chart. The full raw
@@ -113,20 +114,31 @@ def build_engineered_features(raw_df):
     return d
 
 
+MAX_SCORING_LOOKBACK_HOURS = 24
+
+
 def get_latest_valid_row(engineered_df):
-    """The most recent row with a real (non-NaN) 'aqi' reading -- NOT
-    necessarily engineered_df.iloc[-1], since a paused feature pipeline (see
-    project notes: feature_pipeline.yml is currently paused to save
-    free-tier quota) can leave the tail of the hourly grid as gap
-    placeholders rather than real data."""
-    valid = engineered_df[engineered_df["aqi"].notna()]
-    if valid.empty:
-        raise RuntimeError(
-            "No row with a valid 'aqi' value found in the feature data pulled "
-            "from Hopsworks -- the feature group may be empty or missing the "
-            "'aqi' column."
-        )
-    return valid.iloc[-1]
+    """The most recent row with every model feature (get_feature_columns())
+    present and non-NaN -- NOT necessarily engineered_df.iloc[-1], since a
+    paused feature pipeline (see project notes: feature_pipeline.yml is
+    currently paused to save free-tier quota) can leave the tail of the
+    hourly grid as gap placeholders, or with lag/rolling features that
+    haven't materialized yet, rather than a row that's actually complete
+    enough to score. Walks backwards from the newest row, capped at
+    MAX_SCORING_LOOKBACK_HOURS, rather than recomputing any feature (e.g.
+    change rates) locally -- that would duplicate the pipeline's formula in
+    a second place and risk train/serve skew."""
+    feature_cols = get_feature_columns(engineered_df)
+    n = len(engineered_df)
+    for i in range(min(MAX_SCORING_LOOKBACK_HOURS, n)):
+        row = engineered_df.iloc[n - 1 - i]
+        if row[feature_cols].notna().all():
+            return row
+    raise RuntimeError(
+        f"No row in the last {MAX_SCORING_LOOKBACK_HOURS} hours has complete "
+        "(non-NaN) values for all model features -- the feature group may be "
+        "empty, stale, or the feature pipeline may be paused/broken."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -408,14 +420,10 @@ def render_staleness_warning(latest_row, raw_df):
     paused feature pipeline all show up here the same way: as a visible
     gap, not a mystery."""
     newest_raw_ts = raw_df[TIMESTAMP_COL].max()
-    gap = newest_raw_ts - latest_row.name
-    if gap > pd.Timedelta(hours=2):
+    if latest_row.name != newest_raw_ts:
         st.warning(
-            f"Showing data as of {latest_row.name} (UTC) -- newer rows exist "
-            f"in the feature group up to {newest_raw_ts} (UTC), but don't "
-            f"have complete enough features to score yet (missing lag/"
-            f"rolling history, or the timestamp didn't land on the hourly "
-            f"grid). This is a real gap, not a display bug."
+            f"Showing forecast from {latest_row.name.strftime('%Y-%m-%d %H:%M')} "
+            f"UTC. More recent readings exist but have incomplete features."
         )
 
 
