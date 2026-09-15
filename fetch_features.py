@@ -1,0 +1,486 @@
+"""
+fetch_features.py
+
+Step 1 of the AQI Feature Pipeline: cloud-based hourly fetch that writes
+directly into the Hopsworks feature group train_model.py trains from
+(aqi_karachi_features) -- no local files, so this runs unattended on
+GitHub Actions.
+
+REWRITE (2026-08-25) of the original local-CSV prototype. Two real
+problems fixed, plus one latent bug caught along the way:
+
+1. STATE PERSISTENCE. The original script tracked the previous reading
+   (for change-rate features) and AQICN's last station timestamp (for
+   staleness detection) in local files (aqi_features.csv,
+   last_aqicn_state.json). GitHub Actions runners are stateless -- a
+   fresh machine every hour, nothing carries over between runs. State now
+   lives in Hopsworks itself: this script reads back the last
+   CONTEXT_HOURS of rows from the feature group before computing
+   anything, instead of relying on local files.
+
+2. SCHEMA / TRAIN-SERVE CONSISTENCY. The original script wrote columns
+   (ow_pm2_5, ow_aqi_index -- OpenWeather's 1-5 category, aqicn_*) that
+   don't match aqi_karachi_features' actual schema, and never computed
+   the continuous EPA-formula 'aqi' that IS the model's real target.
+   Pushed as-is, live rows would have been unusable for training -- wrong
+   columns, wrong units. Fixed by importing compute_true_aqi.py's exact
+   EPA breakpoint + rolling-window functions (not reimplementing them) so
+   live 'aqi' is derived identically to how the backfill's target was
+   built -- including the 24h/8h TIME-BASED rolling windows, which need
+   the last ~24h of context, not just this hour's instant reading. That
+   context is what the Hopsworks read in fix #1 provides.
+
+3. LATENT UNIT-MISMATCH BUG. AQICN's API returns each pollutant's own AQI
+   SUB-INDEX ("iaqi", already on a 0-500 scale), not a raw concentration
+   in ug/m3. The original script's structure implied AQICN readings could
+   fill in for OpenWeather's pollutant fields on failure -- but that would
+   silently mix AQI sub-indices into columns that are supposed to hold raw
+   ug/m3 concentrations (what the training data and the EPA formula both
+   expect). So AQICN here is a cross-check / staleness signal ONLY --
+   logged, never written into the pollutant columns. If OpenWeather fails
+   for an hour, this script skips that hour's Feature Store insert rather
+   than filling it with wrong-unit AQICN data or a fabricated value. A
+   documented missing hour is a gap train_model.py's hourly-grid
+   reindexing already handles correctly; a silently wrong hour is not.
+
+NOTE: like the other Hopsworks-touching scripts written this session,
+this hasn't been run against your live project from this environment --
+only syntax-checked and logic-smoke-tested with synthetic context data.
+
+INCIDENT (2026-09-01): before the hour-flooring fix below existed, this
+script wrote 'timestamp_utc' straight from OpenWeather's 'dt' (real
+minutes/seconds, e.g. 12:17:33) instead of flooring to the hour like the
+backfill's History API rows. train_model.load_and_prepare_grid()'s exact
+hourly reindex silently dropped every one of those rows, so the pipeline
+ran green for days while contributing nothing -- see dashboard staleness
+investigation. The ~4 rows already inserted at misaligned timestamps are
+left in the feature group as harmless orphans (they still won't land on
+the hourly grid, so they're simply ignored by training/inference) rather
+than deleted or reinserted -- not worth the cleanup for 4 rows.
+
+SELF-HEALING (2026-09-05): GitHub Actions scheduled runs are best-effort
+and get silently dropped under load, so a run missing a few hours is
+expected, not exceptional -- manually re-running backfill_gap.py every
+time was not sustainable and let the dashboard silently re-break between
+manual runs. Every run now reconciles rather than blindly appending one
+row: it reads the newest hour-aligned row with a non-null 'aqi' from the
+feature group first (see reconcile_missing_hours() below), and if it's
+more than an hour behind, backfills the missing hours (capped at
+MAX_HEAL_HOURS per run -- see that constant) using the exact same
+OpenWeather-fetch + trailing-context rolling-aqi logic as
+backfill_gap.py/backfill_historical.py, reused rather than duplicated,
+before fetching and inserting the current hour as usual.
+
+Requires HOPSWORKS_API_KEY and OPENWEATHER_API_KEY as environment
+variables (GitHub Actions secrets in CI, Codespaces secrets locally).
+AQICN_API_TOKEN is optional -- if unset, the cross-check/staleness log is
+skipped but the pipeline still runs fine on OpenWeather alone.
+"""
+
+import os
+import sys
+from datetime import datetime, timedelta, timezone
+
+import pandas as pd
+import requests
+
+from compute_true_aqi import (
+    POLLUTANT_COLUMNS,
+    clean_sentinel_values,
+    compute_sub_indices,
+    categorize,
+)
+
+# ---- CONFIG ----
+OPENWEATHER_API_KEY = os.environ.get("OPENWEATHER_API_KEY")
+AQICN_API_TOKEN = os.environ.get("AQICN_API_TOKEN")
+HOPSWORKS_API_KEY = os.environ.get("HOPSWORKS_API_KEY")
+
+LAT = 24.8607
+LON = 67.0011
+CITY = "karachi"
+
+OPENWEATHER_URL = "http://api.openweathermap.org/data/2.5/air_pollution"
+AQICN_URL = f"https://api.waqi.info/feed/{CITY}/"
+
+TIMESTAMP_COL = "timestamp_utc"
+
+# Must match ingest_to_hopsworks.py / train_model.py's raw feature group.
+RAW_FEATURE_GROUP_NAME = "aqi_karachi_features"
+RAW_FEATURE_GROUP_VERSION = 4
+
+# How far back to pull for the EPA rolling-window context. 30h gives
+# margin over the 24h PM2.5/PM10 window even if an hour or two is missing.
+CONTEXT_HOURS = 30
+
+# Cap on how many hours of gap a single run will heal (see
+# reconcile_missing_hours()). GitHub Actions scheduled runs are
+# best-effort and can be dropped, so a gap of a few hours is routine --
+# but an unbounded healing job (e.g. after a days-long outage) run inside
+# a scheduled hourly job could turn one run into an unexpectedly long,
+# rate-limit-heavy OpenWeather History API job. 168h = 1 week: generous
+# enough to absorb any realistic missed-run streak, small enough to bound
+# a single run's runtime/API usage. A gap larger than this heals over
+# multiple runs (this many hours per run) rather than all at once.
+MAX_HEAL_HOURS = 168
+
+# AQICN ground stations update on a multi-hour cycle (per the mentor's
+# brief) -- flag a station reading older than this as stale rather than
+# treat it as a fresh corroborating signal.
+AQICN_STALE_THRESHOLD_HOURS = 3
+
+
+def fetch_openweather():
+    """Raw pollutant concentrations (ug/m3) + OpenWeather's own 1-5
+    category, straight from the Air Pollution API. Returns None on any
+    failure -- caller decides what to do (currently: skip this hour)."""
+    if not OPENWEATHER_API_KEY:
+        print("  [OpenWeather] Skipped: OPENWEATHER_API_KEY not set.")
+        return None
+    try:
+        params = {"lat": LAT, "lon": LON, "appid": OPENWEATHER_API_KEY}
+        response = requests.get(OPENWEATHER_URL, params=params, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+        entry = data["list"][0]
+        components = entry["components"]
+        # OpenWeather's 'dt' carries real minutes/seconds (e.g. 12:17:33),
+        # unlike the backfill's History API rows which land exactly on :00.
+        # train_model.load_and_prepare_grid() reindexes onto an EXACT hourly
+        # grid (pd.date_range(..., freq="h")) with no tolerance -- a row not
+        # sitting on :00 matches no grid point and is silently dropped
+        # during reindexing. Flooring here is what makes every downstream
+        # row actually land in the training grid instead of vanishing.
+        dt = datetime.fromtimestamp(entry["dt"], tz=timezone.utc)
+        dt = dt.replace(minute=0, second=0, microsecond=0)
+        return {
+            "dt": dt,
+            "aqi_index_openweather_1to5": entry["main"]["aqi"],
+            "co": components.get("co"),
+            "no": components.get("no"),
+            "no2": components.get("no2"),
+            "o3": components.get("o3"),
+            "so2": components.get("so2"),
+            "pm2_5": components.get("pm2_5"),
+            "pm10": components.get("pm10"),
+            "nh3": components.get("nh3"),
+        }
+    except requests.exceptions.HTTPError as e:
+        print(f"  [OpenWeather] HTTP error (key may still be inactive): {e}")
+        return None
+    except Exception as e:
+        print(f"  [OpenWeather] Failed: {e}")
+        return None
+
+
+def fetch_aqicn():
+    """AQICN cross-check + staleness signal ONLY -- see module docstring
+    (fix #3) on why its 'iaqi' values never get written into the
+    pollutant columns."""
+    if not AQICN_API_TOKEN:
+        print("  [AQICN] Skipped: AQICN_API_TOKEN not set.")
+        return None
+    try:
+        params = {"token": AQICN_API_TOKEN}
+        response = requests.get(AQICN_URL, params=params, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+        if data.get("status") != "ok":
+            print(f"  [AQICN] API returned an error: {data}")
+            return None
+
+        raw = data["data"]
+        station_dt_str = raw.get("time", {}).get("s")
+        is_stale = None
+        if station_dt_str:
+            try:
+                station_dt = datetime.strptime(station_dt_str, "%Y-%m-%d %H:%M:%S")
+                station_dt = station_dt.replace(tzinfo=timezone.utc)
+                age_hours = (datetime.now(timezone.utc) - station_dt).total_seconds() / 3600.0
+                is_stale = age_hours > AQICN_STALE_THRESHOLD_HOURS
+            except ValueError:
+                pass
+
+        return {
+            "aqicn_aqi": raw.get("aqi"),
+            "aqicn_dominant_pollutant": raw.get("dominentpol"),
+            "aqicn_station_timestamp": station_dt_str,
+            "aqicn_is_stale": is_stale,
+        }
+    except Exception as e:
+        print(f"  [AQICN] Failed: {e}")
+        return None
+
+
+def reconcile_missing_hours(fg):
+    """Reconciliation step run at the top of every hourly pipeline run
+    (see module docstring's SELF-HEALING note): reads the full feature
+    group, detects any gap since the newest hour-aligned row with a
+    non-null 'aqi' (reusing backfill_gap.determine_gap() -- the exact
+    logic backfill_gap.py used to run by hand), and if one exists,
+    backfills it via backfill_gap.build_gap_rows() -- the SAME
+    OpenWeather-fetch + trailing-context EPA rolling-aqi logic
+    backfill_gap.py/backfill_historical.py use, reused rather than
+    reimplemented so a healed stretch's first hours get their 'aqi' from
+    the same trailing-context window, not a truncated one.
+
+    Capped at MAX_HEAL_HOURS per run -- a gap beyond the cap heals
+    partially this run (logged loudly) and the rest on a later run,
+    rather than turning one scheduled run into an unbounded OpenWeather
+    History API job.
+
+    Returns (full_df, n_healed): full_df is the feature group's data with
+    any newly-inserted gap rows already appended (so the caller can use
+    it as rolling-window context for the live row without re-reading from
+    Hopsworks), and n_healed is how many hours were backfilled. Returns
+    (empty df, 0) if the feature group can't be read at all -- the caller
+    then computes the live row's 'aqi' from this hour's reading alone,
+    same degraded behavior as before this reconciliation step existed."""
+    try:
+        df = fg.read()
+        df[TIMESTAMP_COL] = pd.to_datetime(df[TIMESTAMP_COL], utc=True)
+    except Exception as e:
+        print(
+            f"  WARNING: couldn't read the feature group from Hopsworks "
+            f"({type(e).__name__}: {e}) -- skipping gap healing and computing "
+            f"this hour's 'aqi' from this hour's reading alone, with no "
+            f"rolling-window history."
+        )
+        return pd.DataFrame(), 0
+
+    from backfill_gap import build_gap_rows, determine_gap
+
+    gap = determine_gap(df)
+    if gap is None:
+        print("  WARNING: no hour-aligned row with a non-null 'aqi' found in the "
+              "feature group -- can't determine a gap. Skipping healing.")
+        return df, 0
+    newest_valid_ts, gap_start, now_floored = gap
+    if gap_start > now_floored:
+        print("  No gap: feature group is already current through this hour.")
+        return df, 0
+
+    total_gap_hours = int((now_floored - gap_start).total_seconds() // 3600) + 1
+    fill_end = now_floored
+    if total_gap_hours > MAX_HEAL_HOURS:
+        fill_end = gap_start + timedelta(hours=MAX_HEAL_HOURS - 1)
+        remaining_hours = total_gap_hours - MAX_HEAL_HOURS
+        print(
+            f"  GAP DETECTED: {total_gap_hours}h missing ({gap_start.isoformat()} -> "
+            f"{now_floored.isoformat()}), exceeding the {MAX_HEAL_HOURS}h per-run "
+            f"healing cap. Healing {gap_start.isoformat()} -> {fill_end.isoformat()} "
+            f"this run; {remaining_hours}h will REMAIN MISSING and should heal on "
+            f"subsequent run(s)."
+        )
+    else:
+        print(
+            f"  GAP DETECTED: {total_gap_hours}h missing "
+            f"({gap_start.isoformat()} -> {now_floored.isoformat()}). Healing in full this run."
+        )
+
+    gap_df = build_gap_rows(df, newest_valid_ts, gap_start, fill_end)
+    if gap_df.empty:
+        print("  No gap rows returned to insert -- nothing healed.")
+        return df, 0
+
+    print(
+        f"  Inserting {len(gap_df)} backfilled hour(s) into "
+        f"{RAW_FEATURE_GROUP_NAME} v{RAW_FEATURE_GROUP_VERSION}..."
+    )
+    fg.insert(gap_df, write_options={"wait_for_job": False})
+
+    combined = pd.concat([df, gap_df], ignore_index=True)
+    combined = combined.sort_values(TIMESTAMP_COL).drop_duplicates(subset=[TIMESTAMP_COL], keep="last")
+    return combined, len(gap_df)
+
+
+def compute_live_aqi(context_df, ow_data):
+    """Appends the new OpenWeather reading to the recent context and runs
+    the SAME EPA rolling-window computation compute_true_aqi.py uses on
+    the backfill, so live 'aqi' is derived identically to training 'aqi'.
+    Returns (aqi, dominant_pollutant, category)."""
+    new_row = {col: ow_data.get(col) for col in POLLUTANT_COLUMNS.values()}
+    new_row[TIMESTAMP_COL] = ow_data["dt"]
+    combined = pd.concat([context_df, pd.DataFrame([new_row])], ignore_index=True)
+    combined = combined.sort_values(TIMESTAMP_COL).drop_duplicates(subset=[TIMESTAMP_COL], keep="last")
+    combined = clean_sentinel_values(combined)
+    combined_indexed = combined.set_index(TIMESTAMP_COL)
+
+    sub_indices = compute_sub_indices(combined_indexed)
+    last = sub_indices.iloc[-1]
+    aqi = float(last.max())
+    dominant = str(last.idxmax())
+    category = categorize(aqi)
+    return aqi, dominant, category
+
+
+def compute_change_rates(context_df, current_dt, current_aqi, current_pm25):
+    """AQI/PM2.5 change rate vs. the most recent row already in Hopsworks,
+    normalized per hour. (None, None) if there's no prior row or elapsed
+    time is non-positive (clock issue / duplicate run within the hour)."""
+    if context_df.empty or "aqi" not in context_df.columns:
+        return None, None
+    prev = context_df.sort_values(TIMESTAMP_COL).iloc[-1]
+    prev_dt = prev[TIMESTAMP_COL]
+    hours_elapsed = (current_dt - prev_dt).total_seconds() / 3600.0
+    if hours_elapsed <= 0:
+        return None, None
+
+    aqi_rate = None
+    if pd.notna(prev.get("aqi")) and current_aqi is not None:
+        aqi_rate = round((current_aqi - prev["aqi"]) / hours_elapsed, 4)
+
+    pm25_rate = None
+    if pd.notna(prev.get("pm2_5")) and current_pm25 is not None:
+        pm25_rate = round((current_pm25 - prev["pm2_5"]) / hours_elapsed, 4)
+
+    return aqi_rate, pm25_rate
+
+
+def build_row(ow_data, context_df):
+    dt = ow_data["dt"]
+    # Guard against this class of bug recurring silently: a misaligned
+    # timestamp here would be dropped without warning by
+    # train_model.load_and_prepare_grid()'s exact hourly reindex, and the
+    # pipeline would keep reporting success while contributing nothing.
+    assert dt.minute == 0 and dt.second == 0 and dt.microsecond == 0, (
+        f"Observation timestamp {dt.isoformat()} is not floored to the hour "
+        f"-- this row would be silently dropped by the training grid reindex."
+    )
+    aqi, dominant, category = compute_live_aqi(context_df, ow_data)
+    aqi_rate, pm25_rate = compute_change_rates(context_df, dt, aqi, ow_data.get("pm2_5"))
+
+    return {
+        TIMESTAMP_COL: dt.isoformat(),
+        "hour": dt.hour,
+        "day": dt.day,
+        "month": dt.month,
+        "year": dt.year,
+        "day_of_week": dt.weekday(),
+        "co": ow_data.get("co"),
+        "no": ow_data.get("no"),
+        "no2": ow_data.get("no2"),
+        "o3": ow_data.get("o3"),
+        "so2": ow_data.get("so2"),
+        "pm2_5": ow_data.get("pm2_5"),
+        "pm10": ow_data.get("pm10"),
+        "nh3": ow_data.get("nh3"),
+        "aqi_index_openweather_1to5": ow_data.get("aqi_index_openweather_1to5"),
+        # Open-Meteo is a backfill-only cross-check source (see
+        # backfill_historical.py) -- never available live, so these stay
+        # None. Already excluded from model features in train_model.py
+        # for exactly this train-serve-skew reason.
+        "om_pm2_5": None,
+        "om_pm10": None,
+        "om_co": None,
+        "om_no2": None,
+        "om_so2": None,
+        "om_o3": None,
+        "om_us_aqi": None,
+        "pm25_source_diff": None,
+        "pm25_source_diff_pct": None,
+        "aqi": aqi,
+        "aqi_dominant_pollutant": dominant,
+        "aqi_category": category,
+        "aqi_change_rate": aqi_rate,
+        "pm25_change_rate": pm25_rate,
+        # Derived from the (now hour-floored) Unix timestamp, not
+        # sequential -- avoids any collision with the backfill's sequential
+        # 0..16751 row_ids (a 2026 epoch-second value is ~1.78e9). Basing
+        # this on the floored dt makes it idempotent: re-running this
+        # script for an hour that already has a row reproduces the same
+        # row_id and upserts in place instead of inserting a near-duplicate
+        # row a few seconds/minutes apart.
+        "row_id": int(dt.timestamp()),
+    }
+
+
+def main():
+    if not HOPSWORKS_API_KEY:
+        print("ERROR: HOPSWORKS_API_KEY not set.")
+        sys.exit(1)
+
+    import hopsworks
+
+    print("Connecting to Hopsworks...")
+    project = hopsworks.login(api_key_value=HOPSWORKS_API_KEY)
+    fs = project.get_feature_store()
+    fg = fs.get_feature_group(name=RAW_FEATURE_GROUP_NAME, version=RAW_FEATURE_GROUP_VERSION)
+
+    print("Reconciling any missing hours since the last recorded run...")
+    full_df, n_healed = reconcile_missing_hours(fg)
+
+    print("\nFetching from OpenWeather (primary)...")
+    ow_data = fetch_openweather()
+
+    print("Fetching from AQICN (cross-check / staleness only)...")
+    aqicn_data = fetch_aqicn()
+    if aqicn_data:
+        if aqicn_data.get("aqicn_is_stale"):
+            print(
+                f"  [AQICN] STALE: station reading is older than "
+                f"{AQICN_STALE_THRESHOLD_HOURS}h ({aqicn_data.get('aqicn_station_timestamp')}) "
+                f"-- logged for visibility, not used quantitatively."
+            )
+        else:
+            print(
+                f"  [AQICN] aqi={aqicn_data.get('aqicn_aqi')}, "
+                f"dominant={aqicn_data.get('aqicn_dominant_pollutant')}"
+            )
+
+    if not ow_data:
+        print(
+            "\nNo OpenWeather reading available this hour -- skipping this "
+            "hour's Feature Store insert rather than writing a wrong-unit or "
+            "incomplete row. This shows up as a real gap in the data; "
+            "train_model.py's hourly-grid reindexing already handles gaps "
+            "correctly."
+        )
+        sys.exit(0)  # a documented skipped hour, not a pipeline failure
+
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=CONTEXT_HOURS)
+    if not full_df.empty:
+        context_df = full_df[full_df[TIMESTAMP_COL] >= cutoff].sort_values(TIMESTAMP_COL)
+    else:
+        context_df = full_df
+    print(f"  Using {len(context_df)} row(s) of context from the last {CONTEXT_HOURS}h "
+          f"(includes any hour(s) just healed above) for this hour's rolling-window calc.")
+
+    row = build_row(ow_data, context_df)
+
+    print("\nNew feature row:")
+    for k, v in row.items():
+        print(f"  {k}: {v}")
+
+    row_df = pd.DataFrame([row])
+    row_df[TIMESTAMP_COL] = pd.to_datetime(row_df[TIMESTAMP_COL], utc=True)
+
+    # The Hopsworks feature group's schema expects 'double' for every
+    # numeric column here (the backfill CSV that created it had NaNs
+    # mixed into these at various points, which upcasts a whole column to
+    # float64 -- but a single clean live row like this one, e.g.
+    # nh3=0 or aqi_index=3, gets inferred as int/bigint by pandas, which
+    # Hopsworks then rejects as a schema mismatch). Force float
+    # explicitly rather than relying on inference.
+    float_cols = [
+        "co", "no", "no2", "o3", "so2", "pm2_5", "pm10", "nh3",
+        "aqi_index_openweather_1to5", "aqi",
+        "aqi_change_rate", "pm25_change_rate",
+        "om_pm2_5", "om_pm10", "om_co", "om_no2", "om_so2", "om_o3", "om_us_aqi",
+        "pm25_source_diff", "pm25_source_diff_pct",
+    ]
+    for col in float_cols:
+        row_df[col] = row_df[col].astype(float)
+
+    print(f"\nInserting into Hopsworks feature group {RAW_FEATURE_GROUP_NAME} v{RAW_FEATURE_GROUP_VERSION}...")
+    fg.insert(row_df, write_options={"wait_for_job": False})
+    print("Insert submitted.")
+
+    print(
+        f"\nRUN SUMMARY: {n_healed} backfilled hour(s) healed via gap "
+        f"reconciliation, 1 live hour inserted ({row[TIMESTAMP_COL]})."
+    )
+
+
+if __name__ == "__main__":
+    main()
